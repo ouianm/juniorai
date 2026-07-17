@@ -218,6 +218,21 @@ fn create_autopsy() -> Result<()> {
         }
     }
 
+    let untested_changes = find_untested_changes(&session.events);
+
+    if !untested_changes.is_empty() {
+        println!();
+        println!("Possible process issue:");
+        println!("Repository changes were recorded without a successful test afterwards.");
+
+        for command in untested_changes {
+            println!("- Last detected change: `{command}`");
+        }
+
+        println!("Confidence: Medium");
+        println!("Alternative explanation: testing may have been performed outside JuniorAI.");
+    }
+
     Ok(())
 }
 
@@ -364,4 +379,47 @@ fn latest_completed_session() -> Result<Session> {
         .context("No completed sessions found")?;
 
     load_session(&latest)
+}
+fn is_test_command(command: &str) -> bool {
+    let normalized = command.trim().to_lowercase();
+
+    normalized.starts_with("cargo test")
+        || normalized.starts_with("npm test")
+        || normalized.starts_with("npm run test")
+        || normalized.starts_with("pnpm test")
+        || normalized.starts_with("yarn test")
+        || normalized.starts_with("pytest")
+        || normalized.starts_with("python -m pytest")
+        || normalized.starts_with("mvn test")
+        || normalized.starts_with("./mvnw test")
+        || normalized.starts_with("gradle test")
+        || normalized.starts_with("./gradlew test")
+        || normalized.starts_with("dotnet test")
+        || normalized.starts_with("go test")
+}
+
+fn find_untested_changes(events: &[CommandEvent]) -> Vec<String> {
+    let mut untested_changes = Vec::new();
+    let mut pending_change: Option<String> = None;
+
+    for event in events {
+        let changed_repository = match (&event.git_before, &event.git_after) {
+            (Some(before), Some(after)) => before.changed_files != after.changed_files,
+            _ => false,
+        };
+
+        if changed_repository {
+            pending_change = Some(event.command.clone());
+        }
+
+        if is_test_command(&event.command) && event.exit_code == Some(0) {
+            pending_change = None;
+        }
+    }
+
+    if let Some(command) = pending_change {
+        untested_changes.push(command);
+    }
+
+    untested_changes
 }
