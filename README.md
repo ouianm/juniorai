@@ -15,6 +15,7 @@ and generates a debugging autopsy based on the observed workflow.
 - Detect commands that changed the working tree
 - Detect failed commands
 - Detect repeated commands
+- Detect untested code changes
 - Generate a local debugging autopsy
 - Store all session data locally as JSON
 - Express uncertain conclusions with confidence and alternative explanations
@@ -34,7 +35,6 @@ cargo run -- autopsy
 JuniorAI does not yet detect deeper debugging patterns such as:
 
 - Modifying code before reproducing an error
-- Changing code without testing afterwards
 - Repeatedly trying the same unsuccessful approach
 - Making too many changes at once
 - Long-term personal debugging patterns
