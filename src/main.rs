@@ -423,3 +423,87 @@ fn find_untested_changes(events: &[CommandEvent]) -> Vec<String> {
 
     untested_changes
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snapshot(files: &[&str]) -> GitSnapshot {
+        GitSnapshot {
+            branch: Some("main".to_string()),
+            changed_files: files.iter().map(|file| file.to_string()).collect(),
+        }
+    }
+
+    fn event(command: &str, exit_code: i32, before: &[&str], after: &[&str]) -> CommandEvent {
+        CommandEvent {
+            timestamp: Utc::now(),
+            command: command.to_string(),
+            exit_code: Some(exit_code),
+            stdout: String::new(),
+            stderr: String::new(),
+            git_before: Some(snapshot(before)),
+            git_after: Some(snapshot(after)),
+        }
+    }
+
+    #[test]
+    fn recognizes_common_test_commands() {
+        assert!(is_test_command("cargo test"));
+        assert!(is_test_command("cargo test --all"));
+        assert!(is_test_command("pytest"));
+        assert!(is_test_command("npm run test"));
+        assert!(is_test_command("./gradlew test"));
+        assert!(is_test_command("dotnet test"));
+
+        assert!(!is_test_command("cargo build"));
+        assert!(!is_test_command("git status"));
+        assert!(!is_test_command("echo test"));
+    }
+
+    #[test]
+    fn detects_repository_change_without_test() {
+        let events = vec![event("touch example.txt", 0, &[], &["example.txt"])];
+
+        let result = find_untested_changes(&events);
+
+        assert_eq!(result, vec!["touch example.txt"]);
+    }
+
+    #[test]
+    fn successful_test_clears_pending_change() {
+        let events = vec![
+            event("touch example.txt", 0, &[], &["example.txt"]),
+            event("cargo test", 0, &["example.txt"], &["example.txt"]),
+        ];
+
+        let result = find_untested_changes(&events);
+
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn failed_test_does_not_clear_pending_change() {
+        let events = vec![
+            event("touch example.txt", 0, &[], &["example.txt"]),
+            event("cargo test", 101, &["example.txt"], &["example.txt"]),
+        ];
+
+        let result = find_untested_changes(&events);
+
+        assert_eq!(result, vec!["touch example.txt"]);
+    }
+
+    #[test]
+    fn detects_repeated_commands() {
+        let events = vec![
+            event("git status", 0, &[], &[]),
+            event("cargo build", 0, &[], &[]),
+            event("git status", 0, &[], &[]),
+        ];
+
+        let result = find_repeated_commands(&events);
+
+        assert_eq!(result, vec![("git status".to_string(), 2)]);
+    }
+}
