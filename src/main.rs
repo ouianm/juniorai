@@ -10,6 +10,13 @@ use std::{
 };
 use uuid::Uuid;
 
+const CURRENT_SCHEMA_VERSION: u32 = 1;
+const LEGACY_SCHEMA_VERSION: u32 = 1;
+
+fn default_schema_version() -> u32 {
+    LEGACY_SCHEMA_VERSION
+}
+
 #[derive(Parser)]
 #[command(
     name = "juniorai",
@@ -36,6 +43,8 @@ enum Commands {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Session {
+    #[serde(default = "default_schema_version")]
+    schema_version: u32,
     id: Uuid,
     goal: String,
     started_at: DateTime<Utc>,
@@ -50,7 +59,11 @@ struct CommandEvent {
     exit_code: Option<i32>,
     stdout: String,
     stderr: String,
+
+    #[serde(default)]
     git_before: Option<GitSnapshot>,
+
+    #[serde(default)]
     git_after: Option<GitSnapshot>,
 }
 
@@ -79,6 +92,7 @@ fn start_session(goal: String) -> Result<()> {
     }
 
     let session = Session {
+        schema_version: CURRENT_SCHEMA_VERSION,
         id: Uuid::new_v4(),
         goal,
         started_at: Utc::now(),
@@ -355,10 +369,28 @@ fn save_session(path: &Path, session: &Session) -> Result<()> {
     fs::write(path, json)?;
     Ok(())
 }
+fn validate_session_schema(session: &Session) -> Result<()> {
+    if session.schema_version > CURRENT_SCHEMA_VERSION {
+        bail!(
+            "Session schema version {} is newer than supported version {}.",
+            session.schema_version,
+            CURRENT_SCHEMA_VERSION
+        );
+    }
+
+    Ok(())
+}
 
 fn load_session(path: &Path) -> Result<Session> {
-    let json = fs::read_to_string(path)?;
-    Ok(serde_json::from_str(&json)?)
+    let json = fs::read_to_string(path)
+        .with_context(|| format!("Failed to read session file: {}", path.display()))?;
+
+    let session: Session = serde_json::from_str(&json)
+        .with_context(|| format!("Failed to parse session file: {}", path.display()))?;
+
+    validate_session_schema(&session)?;
+
+    Ok(session)
 }
 
 fn latest_completed_session() -> Result<Session> {
@@ -427,7 +459,56 @@ fn find_untested_changes(events: &[CommandEvent]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn loads_legacy_session_without_new_fields() {
+        let legacy_json = r#"
+    {
+        "id": "00000000-0000-4000-8000-000000000000",
+        "goal": "Legacy debugging session",
+        "started_at": "2026-07-17T19:00:00Z",
+        "stopped_at": null,
+        "events": [
+            {
+                "timestamp": "2026-07-17T19:01:00Z",
+                "command": "git status",
+                "exit_code": 0,
+                "stdout": "",
+                "stderr": ""
+            }
+        ]
+    }
+    "#;
 
+        let session: Session =
+            serde_json::from_str(legacy_json).expect("Legacy session should load");
+
+        assert_eq!(session.schema_version, LEGACY_SCHEMA_VERSION);
+        assert_eq!(session.goal, "Legacy debugging session");
+        assert_eq!(session.events.len(), 1);
+        assert!(session.events[0].git_before.is_none());
+        assert!(session.events[0].git_after.is_none());
+    }
+
+    #[test]
+    fn rejects_newer_schema_versions() {
+        let session = Session {
+            schema_version: CURRENT_SCHEMA_VERSION + 1,
+            id: Uuid::new_v4(),
+            goal: "Future session".to_string(),
+            started_at: Utc::now(),
+            stopped_at: None,
+            events: Vec::new(),
+        };
+
+        let error = validate_session_schema(&session)
+            .expect_err("A newer schema version should be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("is newer than supported version")
+        );
+    }
     fn snapshot(files: &[&str]) -> GitSnapshot {
         GitSnapshot {
             branch: Some("main".to_string()),
@@ -446,7 +527,6 @@ mod tests {
             git_after: Some(snapshot(after)),
         }
     }
-
     #[test]
     fn recognizes_common_test_commands() {
         assert!(is_test_command("cargo test"));
