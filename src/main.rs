@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
@@ -50,6 +50,14 @@ struct CommandEvent {
     exit_code: Option<i32>,
     stdout: String,
     stderr: String,
+    git_before: Option<GitSnapshot>,
+    git_after: Option<GitSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GitSnapshot {
+    branch: Option<String>,
+    changed_files: Vec<String>,
 }
 
 fn main() -> Result<()> {
@@ -95,11 +103,15 @@ fn run_command(command: String) -> Result<()> {
 
     let mut session = load_session(&path)?;
 
+    let git_before = capture_git_snapshot();
+
     let output = Command::new("zsh")
         .arg("-lc")
         .arg(&command)
         .output()
         .with_context(|| format!("Failed to execute command: {command}"))?;
+
+    let git_after = capture_git_snapshot();
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -113,6 +125,8 @@ fn run_command(command: String) -> Result<()> {
         exit_code: output.status.code(),
         stdout: truncate(stdout, 10_000),
         stderr: truncate(stderr, 10_000),
+        git_before,
+        git_after,
     });
 
     save_session(&path, &session)?;
@@ -170,10 +184,7 @@ fn create_autopsy() -> Result<()> {
         println!("Observed failures:");
 
         for event in failed_commands {
-            println!(
-                "- `{}` exited with {:?}",
-                event.command, event.exit_code
-            );
+            println!("- `{}` exited with {:?}", event.command, event.exit_code);
         }
     }
 
@@ -189,12 +200,109 @@ fn create_autopsy() -> Result<()> {
         }
 
         println!("Confidence: Low");
-        println!(
-            "Alternative explanation: repetition may have been intentional."
-        );
+        println!("Alternative explanation: repetition may have been intentional.");
+    }
+
+    let changed_file_events = find_git_changes(&session.events);
+
+    if !changed_file_events.is_empty() {
+        println!();
+        println!("Observed repository changes:");
+
+        for change in changed_file_events {
+            println!("- `{}` changed the working tree:", change.command);
+
+            for file in change.newly_changed_files {
+                println!("  - {file}");
+            }
+        }
     }
 
     Ok(())
+}
+
+struct GitChangeObservation {
+    command: String,
+    newly_changed_files: Vec<String>,
+}
+
+fn capture_git_snapshot() -> Option<GitSnapshot> {
+    let repository_check = Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .output()
+        .ok()?;
+
+    if !repository_check.status.success() {
+        return None;
+    }
+
+    let branch_output = Command::new("git")
+        .args(["branch", "--show-current"])
+        .output()
+        .ok()?;
+
+    let status_output = Command::new("git")
+        .args(["status", "--short"])
+        .output()
+        .ok()?;
+
+    if !status_output.status.success() {
+        return None;
+    }
+
+    let branch = String::from_utf8_lossy(&branch_output.stdout)
+        .trim()
+        .to_string();
+
+    let changed_files = String::from_utf8_lossy(&status_output.stdout)
+        .lines()
+        .map(extract_git_status_path)
+        .filter(|path| !path.is_empty())
+        .collect();
+
+    Some(GitSnapshot {
+        branch: if branch.is_empty() {
+            None
+        } else {
+            Some(branch)
+        },
+        changed_files,
+    })
+}
+
+fn extract_git_status_path(line: &str) -> String {
+    let path = line.get(3..).unwrap_or(line).trim();
+
+    match path.rsplit_once(" -> ") {
+        Some((_, new_path)) => new_path.to_string(),
+        None => path.to_string(),
+    }
+}
+
+fn find_git_changes(events: &[CommandEvent]) -> Vec<GitChangeObservation> {
+    let mut observations = Vec::new();
+
+    for event in events {
+        let (Some(before), Some(after)) = (&event.git_before, &event.git_after) else {
+            continue;
+        };
+
+        let newly_changed_files: Vec<String> = after
+            .changed_files
+            .iter()
+            .filter(|file| !before.changed_files.contains(file))
+            .cloned()
+            .collect();
+
+        if !newly_changed_files.is_empty() {
+            observations.push(GitChangeObservation {
+                command: event.command.clone(),
+                newly_changed_files,
+            });
+        }
+    }
+
+    observations
 }
 
 fn find_repeated_commands(events: &[CommandEvent]) -> Vec<(String, usize)> {
@@ -204,10 +312,8 @@ fn find_repeated_commands(events: &[CommandEvent]) -> Vec<(String, usize)> {
         *counts.entry(event.command.clone()).or_insert(0) += 1;
     }
 
-    let mut repeated: Vec<(String, usize)> = counts
-        .into_iter()
-        .filter(|(_, count)| *count > 1)
-        .collect();
+    let mut repeated: Vec<(String, usize)> =
+        counts.into_iter().filter(|(_, count)| *count > 1).collect();
 
     repeated.sort_by(|a, b| b.1.cmp(&a.1));
 
